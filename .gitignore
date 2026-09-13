@@ -1,0 +1,4 @@
+leaves.json
+__pycache__/
+*.tmp
+*.bak
