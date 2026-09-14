@@ -7,6 +7,9 @@
     python ctzh.py --restore              # 从 .bak 恢复原版
     python ctzh.py --extract-only         # 只提取字典结构到 leaves.json(供编辑参考)
     python ctzh.py --lang my.json         # 使用自定义语言文件
+    python ctzh.py --workers 32           # 最多使用 32 个压缩线程
+    python ctzh.py --cache-only           # 只求解并缓存,不写入游戏
+    python ctzh.py --method search        # 使用传统随机注释搜索
 
 语言文件 language.json: [{"id":..,"key":"..","zh":".."}] 数组。
 zh 为空/缺失的条目保持英文原文;{xxx} 占位符必须与原文一致(会校验,不一致则跳过)。
@@ -21,8 +24,10 @@ import random
 import re
 import struct
 import sys
+import tempfile
+import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import brotli
 import pefile
@@ -31,15 +36,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 PAD_MAX = 6_000_000
 QUALITIES = (11, 10, 9)
+FAST_QUALITIES = (4, 6, 9, 10, 11)
 PLACEHOLDER = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
 ANCHOR = "console:{ready:"
 CATALOG_START = "app:{title:"
 
-_rng = random.Random(0xC0FFEE)
-PAD = "".join(_rng.choice(ALNUM) for _ in range(PAD_MAX)).encode()
+_PAD = None
+_PAD_LOCK = threading.Lock()
 
-_JS = b""
-_T = 0
+
+def get_pad():
+    """Generate the original deterministic padding only when search needs it."""
+    global _PAD
+    with _PAD_LOCK:
+        if _PAD is None:
+            rng = random.Random(0xC0FFEE)
+            _PAD = bytes(ord(rng.choice(ALNUM)) for _ in range(PAD_MAX))
+    return _PAD
 
 
 # ---------- shared leaf encoder (style-preserving re-injection) ----------
@@ -401,77 +414,371 @@ def ph(s):
 
 
 def inject(host_src, host_leaves, zh_by_key):
-    applied = 0
-    out = host_src
-    for leaf in sorted(host_leaves, key=lambda l: l["span"][0], reverse=True):
+    applied, cursor = 0, 0
+    parts = []
+    for leaf in sorted(host_leaves, key=lambda l: l["span"][0]):
         zh = zh_by_key.get(".".join(leaf["path"]))
         if zh is None:
             continue
         s0, s1 = leaf["span"]
-        out = out[:s0] + encode_leaf(leaf["style"], zh) + out[s1:]
+        parts.extend((host_src[cursor:s0], encode_leaf(leaf["style"], zh)))
+        cursor = s1
         applied += 1
-    return out, applied
+    parts.append(host_src[cursor:])
+    return "".join(parts), applied
 
 
-# ---------- exact-size brotli solve ----------
+# ---------- durable, content-addressed solution cache ----------
 
-def _init(js, t):
-    global _JS, _T
-    _JS, _T = js, t
+def atomic_write(path, content):
+    """Flush a complete file to disk, then replace its destination atomically."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".ctzh-", suffix=".tmp",
+                                         delete=False) as stream:
+            temp_path = stream.name
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
-def _probe(args):
-    q, R = args
-    blob = brotli.compress(_JS + b"\n/*" + PAD[:R] + b"*/", quality=q)
-    return q, R, len(blob), blob if len(blob) == _T else None
+def validate_solution(js, target, params, blob):
+    if len(blob) != target:
+        raise ValueError("压缩尺寸与目标不符")
+    if type(params.get("q")) is not int or not 0 <= params["q"] <= 11:
+        raise ValueError("无效压缩质量")
+    if params.get("method") == "metadata":
+        expected = js
+    elif params.get("method") == "search":
+        R = params.get("R")
+        if type(R) is not int or not 0 <= R <= PAD_MAX:
+            raise ValueError("无效随机填充长度")
+        expected = js + b"\n/*" + get_pad()[:R] + b"*/"
+    else:
+        raise ValueError("未知求解方式")
+    if brotli.decompress(blob) != expected:
+        raise ValueError("解压内容校验失败")
 
 
-def _solve_quality(pool, T_LEN, q):
-    c0 = len(brotli.compress(_JS, quality=q))
-    if c0 > T_LEN - 32:
+class SolutionCache:
+    """Each asset commits separately; a manifest only points to a durable blob."""
+    def __init__(self, directory):
+        self.directory = os.path.join(os.path.abspath(directory), "v2")
+        os.makedirs(self.directory, exist_ok=True)
+
+    def identity(self, js, target):
+        js_sig = hashlib.sha256(js).hexdigest()
+        key = hashlib.sha256(f"ctzh-v2:{target}:{js_sig}".encode()).hexdigest()
+        return key, js_sig
+
+    def load(self, js, target, method="auto"):
+        key, js_sig = self.identity(js, target)
+        methods = ("metadata", "search") if method == "auto" else (method,)
+        for kind in methods:
+            manifest = os.path.join(self.directory, f"{key}.{kind}.json")
+            if not os.path.exists(manifest):
+                continue
+            try:
+                with open(manifest, encoding="utf-8") as stream:
+                    entry = json.load(stream)
+                if (entry["version"] != 2 or entry["js_sha256"] != js_sig
+                        or entry["target"] != target or entry["params"]["method"] != kind):
+                    raise ValueError("缓存版本或内容指纹不符")
+                digest = entry["blob_sha256"]
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError("无效缓存指纹")
+                with open(os.path.join(self.directory, f"{key}.{digest}.br"), "rb") as stream:
+                    blob = stream.read()
+                if hashlib.sha256(blob).hexdigest() != digest:
+                    raise ValueError("缓存数据已损坏")
+                validate_solution(js, target, entry["params"], blob)
+                return entry["params"], blob
+            except (OSError, ValueError, KeyError, TypeError, brotli.error) as error:
+                print(f"    忽略无效缓存 {os.path.basename(manifest)}: {error}", flush=True)
         return None
-    hi_bound = min(PAD_MAX - 100, int((T_LEN - c0) / 0.70) + 4000)
-    step = max(400, hi_bound // 400)
-    grid = list(range(0, hi_bound + 1, step))
-    res = {}
-    t0 = time.time()
-    for fut in as_completed([pool.submit(_probe, (q, r)) for r in grid]):
-        _q, R, n, blob = fut.result()
-        if blob is not None:
-            return R, blob
-        res[R] = n
-    prev, bracket = grid[0], None
-    for r in grid[1:]:
-        a, b = res[prev] - T_LEN, res[r] - T_LEN
-        if (a < 0 <= b) or (a > 0 >= b):
-            bracket = (prev, r); break
-        prev = r
-    if bracket is None:
-        return None
-    lo, hi = bracket
-    dlo, dhi = max(0, lo - step), min(PAD_MAX - 100, hi + step)
-    for fut in as_completed([pool.submit(_probe, (q, r)) for r in range(dlo, dhi + 1)]):
-        _q, R, n, blob = fut.result()
-        if blob is not None:
-            print(f"      hit q={q} R={R:,} ({time.time()-t0:.0f}s)", flush=True)
-            return R, blob
+
+    def save(self, js, target, params, blob):
+        validate_solution(js, target, params, blob)
+        key, js_sig = self.identity(js, target)
+        digest = hashlib.sha256(blob).hexdigest()
+        entry = {"version": 2, "js_sha256": js_sig, "target": target,
+                 "params": params, "blob_sha256": digest}
+        atomic_write(os.path.join(self.directory, f"{key}.{digest}.br"), blob)
+        atomic_write(os.path.join(self.directory, f"{key}.{params['method']}.json"),
+                     json.dumps(entry, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+# ---------- exact-size brotli: one compression + metadata padding ----------
+
+def metadata_padding(size):
+    """Exactly size bytes of RFC 7932 section 9.2 metadata (no decoded data).
+
+    At a byte boundary: ISLAST=0, MNIBBLES=11, reserved=0,
+    MSKIPBYTES (2 bits), MSKIPLEN-1 (0/8/16/24 bits), zero alignment.
+    Length fields must use their shortest representation. A zero-length
+    block occupies one byte, so even the 1- and 2-byte gaps are fillable.
+    """
+    if size < 0:
+        raise ValueError("填充长度不能为负")
+    parts = []
+    while size:
+        for nbytes in (3, 2, 1):
+            count = min(size - nbytes - 1, 1 << (8 * nbytes))
+            minimum = 1 if nbytes == 1 else (1 << (8 * (nbytes - 1))) + 1
+            if count >= minimum:
+                header = 6 | (nbytes << 4) | ((count - 1) << 6)
+                parts.append(header.to_bytes(nbytes + 1, "little") + bytes(count))
+                size -= count + nbytes + 1
+                break
+        else:
+            parts.append(b"\x06")
+            size -= 1
+    return b"".join(parts)
+
+
+def solve_metadata(js, target, stop=None):
+    for q in FAST_QUALITIES:
+        if stop is not None and stop.is_set():
+            raise InterruptedError("求解已停止")
+        compressor = brotli.Compressor(quality=q)
+        # FLUSH completes the current block and byte-aligns the stream with
+        # an empty metadata block. FINISH then emits an empty final block.
+        prefix = compressor.process(js) + compressor.flush()
+        suffix = compressor.finish()
+        if suffix != b"\x03":
+            return None  # Unsupported encoder behavior: use verified search.
+        gap = target - len(prefix) - len(suffix)
+        if gap >= 0:
+            blob = prefix + metadata_padding(gap) + suffix
+            params = {"method": "metadata", "q": q, "padding": gap}
+            try:
+                validate_solution(js, target, params, blob)
+            except (ValueError, brotli.error):
+                return None
+            return params, blob
     return None
 
 
-def solve(js, T_LEN, cache=None):
-    """Return (q, R, blob) where blob == compress(js+\n/*PAD[R]*/, q), len == T_LEN."""
-    if cache:
-        blob = brotli.compress(js + b"\n/*" + PAD[:cache["R"]] + b"*/", quality=cache["q"])
-        if len(blob) == T_LEN:
-            print("      precomputed solution hit", flush=True)
-            return cache["q"], cache["R"], blob
-    workers = max(2, min(8, os.cpu_count() or 4))
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init, initargs=(js, T_LEN)) as pool:
+# ---------- legacy search, with bounded native compression threads ----------
+
+def _probe(js, target, q, R, stop):
+    if stop.is_set():
+        return None
+    blob = brotli.compress(js + b"\n/*" + get_pad()[:R] + b"*/", quality=q)
+    return R, len(blob), blob if len(blob) == target else None
+
+
+def _probes(pool, js, target, q, candidates, workers, stop):
+    """Keep at most workers futures in flight; never queue an entire scan."""
+    candidates = iter(candidates)
+    pending = set()
+    try:
+        while True:
+            while len(pending) < workers and not stop.is_set():
+                try:
+                    R = next(candidates)
+                except StopIteration:
+                    break
+                pending.add(pool.submit(_probe, js, target, q, R, stop))
+            if not pending:
+                return
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                result = future.result()
+                if result is not None:
+                    yield result
+    finally:
+        for future in pending:
+            future.cancel()
+
+
+def _crossing(observations, target):
+    ordered = sorted(observations)
+    pairs = [(lo, hi) for lo, hi in zip(ordered, ordered[1:])
+             if (observations[lo] - target) * (observations[hi] - target) < 0]
+    return min(pairs, key=lambda pair: pair[1] - pair[0]) if pairs else None
+
+
+def _solve_quality(pool, js, target, q, workers, stop):
+    # The old parent process accidentally compressed an empty global _JS here.
+    first = _probe(js, target, q, 0, stop)
+    if first is None:
+        return None
+    _, baseline, blob = first
+    if blob is not None:
+        return {"method": "search", "q": q, "R": 0}, blob
+    if baseline > target:
+        return None
+    observations = {0: baseline}
+    hi = min(PAD_MAX, max(64, int((target - baseline) / 0.70) + 256))
+    while True:
+        result = _probe(js, target, q, hi, stop)
+        if result is None:
+            return None
+        R, size, blob = result
+        if blob is not None:
+            return {"method": "search", "q": q, "R": R}, blob
+        observations[R] = size
+        if size > target:
+            break
+        if hi == PAD_MAX:
+            return None
+        hi = min(PAD_MAX, hi * 2)
+
+    started = time.monotonic()
+    last_report = started
+    # Interpolation usually gets close in one batch; dense scans handle the
+    # non-monotonic size changes caused by Brotli's coding decisions.
+    for _ in range(8):
+        lo, hi = _crossing(observations, target)
+        guess = round(lo + (target - observations[lo]) * (hi - lo)
+                      / (observations[hi] - observations[lo]))
+        guess = max(lo + 1, min(hi - 1, guess))
+        candidates = sorted((r for r in range(max(lo + 1, guess - workers),
+                                               min(hi, guess + workers + 1))
+                             if r not in observations), key=lambda r: abs(r - guess))
+        if not candidates:
+            break
+        for R, size, blob in _probes(pool, js, target, q, candidates, workers, stop):
+            if blob is not None:
+                return {"method": "search", "q": q, "R": R}, blob
+            observations[R] = size
+            if time.monotonic() - last_report >= 15:
+                print(f"      q={q}: 已试 {len(observations)} 次, {time.monotonic()-started:.0f}s",
+                      flush=True)
+                last_report = time.monotonic()
+    lo, hi = _crossing(observations, target)
+    center = (lo + hi) // 2
+    for margin in (400, 1600):
+        candidates = sorted((r for r in range(max(0, lo - margin), min(PAD_MAX, hi + margin) + 1)
+                             if r not in observations), key=lambda r: abs(r - center))
+        for R, size, blob in _probes(pool, js, target, q, candidates, workers, stop):
+            if blob is not None:
+                return {"method": "search", "q": q, "R": R}, blob
+            observations[R] = size
+            if time.monotonic() - last_report >= 15:
+                print(f"      q={q}: 已试 {len(observations)} 次, {time.monotonic()-started:.0f}s",
+                      flush=True)
+                last_report = time.monotonic()
+    return None
+
+
+def solve(js, target, workers=None, on_success=None):
+    """Legacy search. Commit a hit BEFORE waiting for in-flight calls to finish."""
+    workers = workers or default_workers()
+    get_pad()
+    stop = threading.Event()
+    # Google's Brotli binding releases the GIL while compressing, so threads
+    # run on separate CPU cores and share JS/PAD without Windows spawn copies.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         for q in QUALITIES:
-            r = _solve_quality(pool, T_LEN, q)
-            if r:
-                return q, r[0], r[1]
-    raise RuntimeError("无法为资产求得精确压缩尺寸(请确认游戏版本与补丁适用版本一致)")
+            result = _solve_quality(pool, js, target, q, workers, stop)
+            if result is not None:
+                stop.set()
+                validate_solution(js, target, *result)
+                if on_success is not None:
+                    on_success(*result)
+                return result
+    finally:
+        stop.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+    raise RuntimeError("无法求得精确压缩尺寸:请确认游戏版本与语言包;此前成功的结果已保留")
+
+
+def default_workers():
+    return max(1, getattr(os, "process_cpu_count", os.cpu_count)() or 1)
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("必须至少为 1")
+    return number
+
+
+def load_legacy_cache(exe_size, lang_sig):
+    path = os.path.join(HERE, "solutions", f"{exe_size}.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            entry = json.load(stream)
+        if entry.get("lang_sig") == lang_sig and isinstance(entry.get("solutions"), dict):
+            return entry["solutions"]
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, AttributeError) as error:
+        print(f"忽略无效旧缓存: {error}", flush=True)
+    return {}
+
+
+def solve_hosts(hosts, cache, legacy, workers, method):
+    """Parallelize fast jobs across hosts; search jobs share one CPU budget."""
+    stop = threading.Event()
+
+    def save(host, params, blob):
+        cache.save(host["js"], host["asset"]["data_len"], params, blob)
+        host["blob"] = blob
+        detail = (f"metadata={params['padding']:,}" if params["method"] == "metadata"
+                  else f"R={params['R']:,}")
+        print(f"    {host['name']}: 注入 {host['applied']} 处, q={params['q']} {detail}, "
+              "校验 OK, 已缓存到磁盘", flush=True)
+
+    def fast_or_cached(host):
+        if stop.is_set():
+            raise InterruptedError("求解已停止")
+        js, target = host["js"], host["asset"]["data_len"]
+        result = cache.load(js, target, method)
+        if result is not None:
+            host["blob"] = result[1]
+            print(f"    {host['name']}: 磁盘缓存命中, 已校验", flush=True)
+            return True
+        if method != "search":
+            result = solve_metadata(js, target, stop)
+            if result is not None:
+                save(host, *result)
+                return True
+        if method != "metadata":
+            params = legacy.get(host["name"])
+            if isinstance(params, dict):
+                q, R = params.get("q"), params.get("R")
+                if type(q) is int and 0 <= q <= 11 and type(R) is int and 0 <= R <= PAD_MAX:
+                    if stop.is_set():
+                        raise InterruptedError("求解已停止")
+                    blob = brotli.compress(js + b"\n/*" + get_pad()[:R] + b"*/", quality=q)
+                    if len(blob) == target:
+                        save(host, {"method": "search", "q": q, "R": R}, blob)
+                        return True
+        return False
+
+    if not hosts:
+        return
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(hosts)))
+    pending = []
+    try:
+        futures = {pool.submit(fast_or_cached, host): host for host in hosts}
+        while futures:
+            done, _ = wait(futures, timeout=15, return_when=FIRST_COMPLETED)
+            if not done:
+                print(f"    仍在压缩 {len(futures)} 个文件;已完成的结果均已落盘", flush=True)
+            for future in done:
+                host = futures.pop(future)
+                if not future.result():
+                    pending.append(host)
+    finally:
+        stop.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+    for host in pending:
+        if method == "metadata":
+            raise RuntimeError(f"{host['name']}: 快速压缩无法装入目标尺寸,可用 --method auto 回退搜索")
+        print(f"  {host['name']}: 转入随机注释搜索,最多 {workers} 个线程", flush=True)
+        solve(host["js"], host["asset"]["data_len"], workers,
+              on_success=lambda params, blob, h=host: save(h, params, blob))
 
 
 # ---------- main ----------
@@ -497,8 +804,16 @@ def main():
     ap = argparse.ArgumentParser(description="Code: Terraform 中文版补丁")
     ap.add_argument("--exe", help="code-terraform.exe 路径(默认自动查找)")
     ap.add_argument("--lang", default=os.path.join(HERE, "language.json"))
-    ap.add_argument("--restore", action="store_true", help="从 .bak 恢复原版")
-    ap.add_argument("--extract-only", action="store_true", help="只导出字典结构 leaves.json")
+    actions = ap.add_mutually_exclusive_group()
+    actions.add_argument("--restore", action="store_true", help="从 .bak 恢复原版")
+    actions.add_argument("--extract-only", action="store_true", help="只导出字典结构 leaves.json")
+    actions.add_argument("--cache-only", action="store_true", help="只求解并缓存,不改写游戏")
+    ap.add_argument("--workers", type=positive_int, default=default_workers(),
+                    help="压缩线程上限(默认使用全部可用 CPU 逻辑线程)")
+    ap.add_argument("--method", choices=("auto", "metadata", "search"), default="auto",
+                    help="auto:快速填充并自动回退; metadata:只用快速填充; search:传统搜索")
+    ap.add_argument("--cache-dir", default=os.path.join(HERE, "solutions"), help="求解缓存目录")
+    ap.add_argument("--inplace", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     exe = args.exe or locate_exe()
@@ -507,9 +822,9 @@ def main():
         return
 
     print(f"游戏: {exe} ({os.path.getsize(exe):,} 字节)")
-    orig = open(exe, "rb").read()
-    data = bytearray(orig)
-    entries = find_assets(bytes(data))
+    with open(exe, "rb") as stream:
+        orig = stream.read()
+    entries = find_assets(orig)
     print(f"资产表: 发现 {len(entries)} 项")
 
     # decompress + identify dictionary hosts
@@ -518,7 +833,7 @@ def main():
         if not a["path"].endswith(".js") or not a["path"].startswith("/assets/"):
             continue
         try:
-            raw = brotli.decompress(bytes(data[a["data_file_off"]:a["data_file_off"] + a["data_len"]]))
+            raw = brotli.decompress(orig[a["data_file_off"]:a["data_file_off"] + a["data_len"]])
         except Exception:
             continue
         if CATALOG_START.encode() not in raw:
@@ -531,18 +846,18 @@ def main():
         sys.exit("未找到字典宿主 bundle:游戏版本可能不受支持,或文件已被修改")
     print(f"字典宿主: {len(hosts)} 个 -> " + ", ".join(os.path.basename(h['asset']['path']) for h in hosts))
 
-    canon = parse_catalog(hosts[0]["src"])
-    canon = sorted(canon, key=lambda l: l["span"][0])
+    canon = sorted(hosts[0]["leaves"], key=lambda l: l["span"][0])
 
     if args.extract_only:
         out = [{"id": i, "key": ".".join(l["path"]), "en": l["en"]} for i, l in enumerate(canon)]
-        json.dump(out, open(os.path.join(HERE, "leaves.json"), "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=1)
+        atomic_write(os.path.join(HERE, "leaves.json"),
+                     json.dumps(out, ensure_ascii=False, indent=1).encode("utf-8"))
         print(f"leaves.json: {len(out)} 条(含英文原文,供编辑参考)")
         return
 
     # load language + validate against this exe's English
-    lang = json.load(open(args.lang, encoding="utf-8"))
+    with open(args.lang, encoding="utf-8") as stream:
+        lang = json.load(stream)
     by_key = {e["key"]: e for e in lang}
     zh_by_key, bad = {}, 0
     for i, leaf in enumerate(canon):
@@ -557,47 +872,40 @@ def main():
     print(f"语言包: {len(lang)} 条,可注入 {len(zh_by_key)} 条"
           + (f",占位符不合规跳过 {bad} 条" if bad else ""))
 
-    # solve cache keyed by exe+lang
-    sol_path = os.path.join(HERE, "solutions", f"{os.path.getsize(exe)}.json")
+    # Preserve shipped q/R hints; new caches are isolated by actual JS + length.
     lang_sig = hashlib.sha256(json.dumps(zh_by_key, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    cached = {}
-    if os.path.exists(sol_path):
-        j = json.load(open(sol_path, encoding="utf-8"))
-        if j.get("lang_sig") == lang_sig:
-            cached = j.get("solutions", {})
-
-    solutions = {}
+    legacy = load_legacy_cache(len(orig), lang_sig)
+    cache = SolutionCache(args.cache_dir)
+    print(f"压缩线程上限: {args.workers}; 求解方式: {args.method}", flush=True)
+    print(f"逐项缓存: {cache.directory}", flush=True)
     for h in hosts:
-        name = os.path.basename(h["asset"]["path"])
-        T_LEN = h["asset"]["data_len"]
-        print(f"  {name}: 注入并求解(目标压缩尺寸 {T_LEN:,}) ...", flush=True)
+        h["name"] = os.path.basename(h["asset"]["path"])
+        print(f"  {h['name']}: 准备注入(目标压缩尺寸 {h['asset']['data_len']:,}) ...", flush=True)
         new_src, applied = inject(h["src"], h["leaves"], zh_by_key)
-        js = new_src.encode("utf-8")
-        q, R, blob = solve(js, T_LEN, cached.get(name))
-        # byte-exact roundtrip check before anything touches disk
-        dec = brotli.decompress(blob)
-        if len(blob) != T_LEN or not dec.startswith(js) or dec != js + b"\n/*" + PAD[:R] + b"*/":
-            raise RuntimeError(f"{name}: 求解结果校验失败")
-        h["blob"] = blob
-        solutions[name] = {"q": q, "R": R}
-        print(f"    注入 {applied} 处, q={q} R={R:,} 校验 OK", flush=True)
-
-    if len(solutions) == len(hosts):
-        os.makedirs(os.path.join(HERE, "solutions"), exist_ok=True)
-        json.dump({"lang_sig": lang_sig, "solutions": solutions},
-                  open(sol_path, "w", encoding="utf-8"))
+        h["js"], h["applied"] = new_src.encode("utf-8"), applied
+    started = time.monotonic()
+    solve_hosts(hosts, cache, legacy, args.workers, args.method)
+    print(f"全部求解完成: {time.monotonic()-started:.2f}s", flush=True)
+    if args.cache_only:
+        print("已完成全部缓存。再次运行相同命令并去掉 --cache-only 即可应用汉化。")
+        return
 
     # splice all-or-nothing in memory; only then touch the exe
+    data = bytearray(orig)
     for h in hosts:
         a = h["asset"]
+        if (not 0 <= a["data_file_off"] <= len(data) - a["data_len"]
+                or len(h["blob"]) != a["data_len"]):
+            raise RuntimeError(f"{h['name']}: 资产范围或压缩长度校验失败")
         data[a["data_file_off"]:a["data_file_off"] + a["data_len"]] = h["blob"]
+    if len(data) != len(orig):
+        raise RuntimeError("打包后文件尺寸发生变化,已停止写入")
 
     bak = exe + ".bak"
     if not os.path.exists(bak):
         print(f"备份原版 -> {bak}")
-        open(bak, "wb").write(orig)          # untouched original bytes
-    open(exe + ".tmp", "wb").write(bytes(data))
-    os.replace(exe + ".tmp", exe)
+        atomic_write(bak, orig)
+    atomic_write(exe, data)
     print(f"完成!{exe} 已汉化(大小 {os.path.getsize(exe):,} 不变)。启动游戏即生效。")
 
 
@@ -611,4 +919,8 @@ def shutil_restore(exe):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已中断。已成功求解并落盘的结果会在下次运行时直接复用。", file=sys.stderr)
+        sys.exit(130)
