@@ -8,8 +8,9 @@
     python ctzh.py --extract-only         # 只提取字典结构到 leaves.json(供编辑参考)
     python ctzh.py --lang my.json         # 使用自定义语言文件
 
-语言文件 language.json: [{"id":..,"key":"..","zh":".."}] 数组。
+语言文件 language.json: [{"id":..,"key":"..","category":"..","en":"..","zh":".."}] 数组。
 zh 为空/缺失的条目保持英文原文;{xxx} 占位符必须与原文一致(会校验,不一致则跳过)。
+en 为该条录制时的英文原文;游戏更新后原文若变化,自动跳过旧译文(宁缺勿错)。
 
 依赖: pip install brotli pefile
 """
@@ -32,8 +33,11 @@ ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 PAD_MAX = 6_000_000
 QUALITIES = (11, 10, 9)
 PLACEHOLDER = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
+# 游戏更新后旧版 .bak/解算缓存必须失效,以下标志用于识别已打补丁的 exe
+PATCH_SIG = b"\n/*"  # 注入填充注释的开头(配合资产预算检查判定)
 ANCHOR = "console:{ready:"
 CATALOG_START = "app:{title:"
+REGISTRY_PROBE = '"api.api_object_types.battery.level.description"'
 
 _rng = random.Random(0xC0FFEE)
 PAD = "".join(_rng.choice(ALNUM) for _ in range(PAD_MAX)).encode()
@@ -353,6 +357,26 @@ def parse_catalog(js_text):
     return leaves
 
 
+def parse_registry(js_text):
+    """Parse the flat API documentation registry (a second string table that
+    lives OUTSIDE the i18n catalog object): dotted keys like
+    "api.api_object_types.battery.level.description" -> prose.
+    Returns leaves (path=[key], span, style, en) or None."""
+    ci = js_text.find(REGISTRY_PROBE)
+    if ci == -1:
+        return None
+    start = max(0, ci - 1_500_000)
+    cands = [start + m.end() - 1
+             for m in re.finditer(r"([A-Za-z0-9_$]+)\s*=\s*\{", js_text[start:ci])]
+    for oi in reversed(cands):
+        if match_object(js_text, oi) > ci:
+            p = ObjParser(js_text, oi)
+            leaves = []
+            p.parse_object([], leaves)
+            return leaves
+    return None
+
+
 # ---------- PE asset table discovery ----------
 
 def find_assets(exe_bytes):
@@ -404,6 +428,8 @@ def inject(host_src, host_leaves, zh_by_key):
     applied = 0
     out = host_src
     for leaf in sorted(host_leaves, key=lambda l: l["span"][0], reverse=True):
+        if leaf.get("has_interp"):
+            continue
         zh = zh_by_key.get(".".join(leaf["path"]))
         if zh is None:
             continue
@@ -421,24 +447,25 @@ def _init(js, t):
 
 
 def _probe(args):
-    q, R = args
-    blob = brotli.compress(_JS + b"\n/*" + PAD[:R] + b"*/", quality=q)
-    return q, R, len(blob), blob if len(blob) == _T else None
+    q, R, off = args
+    blob = brotli.compress(_JS + b"\n/*" + PAD[off:off + R] + b"*/", quality=q)
+    return q, R, off, len(blob), blob if len(blob) == _T else None
 
 
-def _solve_quality(pool, T_LEN, q):
-    c0 = len(brotli.compress(_JS, quality=q))
+def _solve_quality(pool, js, T_LEN, q):
+    c0 = len(brotli.compress(js, quality=q))
     if c0 > T_LEN - 32:
+        print(f"      q={q}: 基础压缩尺寸 {c0:,} 已超过目标 {T_LEN:,},无预算", flush=True)
         return None
     hi_bound = min(PAD_MAX - 100, int((T_LEN - c0) / 0.70) + 4000)
     step = max(400, hi_bound // 400)
     grid = list(range(0, hi_bound + 1, step))
     res = {}
     t0 = time.time()
-    for fut in as_completed([pool.submit(_probe, (q, r)) for r in grid]):
-        _q, R, n, blob = fut.result()
+    for fut in as_completed([pool.submit(_probe, (q, r, 0)) for r in grid]):
+        _q, R, _o, n, blob = fut.result()
         if blob is not None:
-            return R, blob
+            return R, 0, blob
         res[R] = n
     prev, bracket = grid[0], None
     for r in grid[1:]:
@@ -447,40 +474,61 @@ def _solve_quality(pool, T_LEN, q):
             bracket = (prev, r); break
         prev = r
     if bracket is None:
+        print(f"      q={q}: c0={c0:,} 预算 {T_LEN - c0:,},粗扫网格未跨越目标尺寸", flush=True)
         return None
     lo, hi = bracket
     dlo, dhi = max(0, lo - step), min(PAD_MAX - 100, hi + step)
-    for fut in as_completed([pool.submit(_probe, (q, r)) for r in range(dlo, dhi + 1)]):
-        _q, R, n, blob = fut.result()
-        if blob is not None:
-            print(f"      hit q={q} R={R:,} ({time.time()-t0:.0f}s)", flush=True)
-            return R, blob
+    # size-vs-R has deterministic jitter; where steps jump 2 bytes the target
+    # can be skipped. Different PAD slices at the same R re-quantize the tail,
+    # so sweep a few content offsets until one lands exactly on T_LEN.
+    for off in range(0, 4096, 1024):
+        for fut in as_completed([pool.submit(_probe, (q, r, off)) for r in range(dlo, dhi + 1)]):
+            _q, R, o, n, blob = fut.result()
+            if blob is not None:
+                print(f"      hit q={q} R={R:,} off={off} ({time.time()-t0:.0f}s)", flush=True)
+                return R, off, blob
+        print(f"      q={q} pad-offset {off}: window missed, trying next phase", flush=True)
     return None
 
 
 def solve(js, T_LEN, cache=None):
-    """Return (q, R, blob) where blob == compress(js+\n/*PAD[R]*/, q), len == T_LEN."""
+    """Return (q, R, off, blob) with blob == compress(js+\\n/*PAD[off:off+R]*/), len == T_LEN."""
     if cache:
-        blob = brotli.compress(js + b"\n/*" + PAD[:cache["R"]] + b"*/", quality=cache["q"])
+        off = cache.get("off", 0)
+        blob = brotli.compress(js + b"\n/*" + PAD[off:off + cache["R"]] + b"*/", quality=cache["q"])
         if len(blob) == T_LEN:
             print("      precomputed solution hit", flush=True)
-            return cache["q"], cache["R"], blob
+            return cache["q"], cache["R"], off, blob
     workers = max(2, min(8, os.cpu_count() or 4))
     with ProcessPoolExecutor(max_workers=workers, initializer=_init, initargs=(js, T_LEN)) as pool:
         for q in QUALITIES:
-            r = _solve_quality(pool, T_LEN, q)
+            r = _solve_quality(pool, js, T_LEN, q)
             if r:
-                return q, r[0], r[1]
+                return q, r[0], r[1], r[2]
     raise RuntimeError("无法为资产求得精确压缩尺寸(请确认游戏版本与补丁适用版本一致)")
 
 
 # ---------- main ----------
 
 def locate_exe():
-    for root in (os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
-                 os.environ.get("PROGRAMFILES", r"C:\Program Files"), r"D:\Steam"):
-        vdf = os.path.join(root, "steam", "steamapps", "libraryfolders.vdf")
-        if not os.path.exists(vdf):
+    roots = []
+    try:  # Windows: 注册表里的 Steam 安装位置最可靠(任意盘符)
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+            roots.append(os.path.normpath(winreg.QueryValueEx(k, "SteamPath")[0]))
+    except Exception:
+        pass
+    roots += [os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+              os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+              r"C:\Program Files (x86)\Steam"]
+    for root in roots:
+        direct = os.path.join(root, "steamapps", "common", "CodeTerraform", "code-terraform.exe")
+        if os.path.exists(direct):
+            return direct
+        vdf = next((p for p in (os.path.join(root, "steamapps", "libraryfolders.vdf"),
+                                os.path.join(root, "steam", "steamapps", "libraryfolders.vdf"))
+                    if os.path.exists(p)), None)
+        if vdf is None:
             continue
         for m in re.finditer(r'"path"\s*"(.*?)"', open(vdf, encoding="utf-8", errors="ignore").read()):
             cand = m.group(1).replace("\\\\", "\\")
@@ -507,94 +555,160 @@ def main():
         return
 
     print(f"游戏: {exe} ({os.path.getsize(exe):,} 字节)")
-    orig = open(exe, "rb").read()
+    bak = exe + ".bak"
+
+    def discover(bbuf):
+        """资产表 -> 文本宿主(字典/注册表);返回 (entries, hosts) 或 None。"""
+        e = find_assets(bbuf)
+        hs = []
+        for rva, a in sorted(e.items()):
+            if not a["path"].endswith(".js") or not a["path"].startswith("/assets/"):
+                continue
+            try:
+                raw = brotli.decompress(bbuf[a["data_file_off"]:a["data_file_off"] + a["data_len"]])
+            except Exception:
+                continue
+            # 已打补丁的宿主:尾部带填充注释且解压尺寸顶满资产预算
+            # (js+注释 压缩回 data_len;原版 js 单独压缩恒大于 data_len,不可能误判)
+            if raw.endswith(b"*/") and PATCH_SIG in raw[-len(raw) // 4:] and \
+               len(brotli.compress(raw)) > a["data_len"]:
+                return e, hs, True
+            if CATALOG_START.encode() not in raw and REGISTRY_PROBE.encode() not in raw:
+                continue
+            js = raw.decode("utf-8")
+            cat = parse_catalog(js)
+            if not cat or len(cat) < 5000:
+                cat = None
+            reg = parse_registry(js)
+            if cat or reg:
+                hs.append({"asset": a, "src": js, "cat": cat or [], "reg": reg or []})
+        return e, hs, False
+
+    def build_identity(bbuf):
+        """版本指纹: 资产数 + 各文本宿主的(路径,压缩尺寸) + 补丁标记。"""
+        r = discover(bbuf)
+        if r is None or not r[1]:
+            return None
+        return (len(r[0]), tuple(sorted((h["asset"]["path"], h["asset"]["data_len"])
+                                        for h in r[1])), r[2])
+
+    exe_sz = os.path.getsize(exe)
+    cur = build_identity(open(exe, "rb").read())
+    if cur is None or cur[2]:
+        sys.exit("目标 exe 无法解析或已打补丁;请传干净的 game.exe,或用 --restore 恢复原版")
+    # 重打补丁必须从原版字节出发:已打补丁的 exe 残留上一轮的填充注释,
+    # 会使再注入后的压缩尺寸超出原资产预算。
+    src_path, orig = exe, open(exe, "rb").read()
+    stale = False
+    if os.path.exists(bak):
+        if os.path.getsize(bak) == exe_sz and build_identity(open(bak, "rb").read()) == cur:
+            src_path, orig = bak, open(bak, "rb").read()
+            print("  使用 .bak 原版基线(与当前版本一致,可重复打补丁/改译文后重跑)")
+        else:
+            stale = True
+            print("  .bak 与当前游戏版本不一致(旧版备份或已打补丁),忽略;"
+                  "本次将以当前原版重建")
     data = bytearray(orig)
-    entries = find_assets(bytes(data))
+    entries, hosts, _ = discover(bytes(data))
     print(f"资产表: 发现 {len(entries)} 项")
-
-    # decompress + identify dictionary hosts
-    hosts = []
-    for rva, a in entries.items():
-        if not a["path"].endswith(".js") or not a["path"].startswith("/assets/"):
-            continue
-        try:
-            raw = brotli.decompress(bytes(data[a["data_file_off"]:a["data_file_off"] + a["data_len"]]))
-        except Exception:
-            continue
-        if CATALOG_START.encode() not in raw:
-            continue
-        js = raw.decode("utf-8")
-        leaves = parse_catalog(js)
-        if leaves and len(leaves) > 5000:
-            hosts.append({"asset": a, "src": js, "leaves": leaves})
     if not hosts:
-        sys.exit("未找到字典宿主 bundle:游戏版本可能不受支持,或文件已被修改")
-    print(f"字典宿主: {len(hosts)} 个 -> " + ", ".join(os.path.basename(h['asset']['path']) for h in hosts))
+        sys.exit("未找到字典/注册表宿主 bundle:游戏版本可能不受支持,或文件已被修改")
+    print(f"文本宿主: {len(hosts)} 个 -> " + ", ".join(os.path.basename(h['asset']['path']) for h in hosts))
 
-    canon = parse_catalog(hosts[0]["src"])
-    canon = sorted(canon, key=lambda l: l["span"][0])
+    def canon_from(key):
+        for h in hosts:
+            if h[key]:
+                return sorted(h[key], key=lambda l: l["span"][0])
+        return []
+
+    canon_cat = canon_from("cat")   # i18n dictionary (path lists -> dotted keys)
+    canon_reg = canon_from("reg")   # API doc registry (flat dotted keys)
+    canon = sorted(canon_cat + canon_reg, key=lambda l: l["span"][0])
+    if not canon_cat:
+        sys.exit("未解析到 i18n 字典")
 
     if args.extract_only:
-        out = [{"id": i, "key": ".".join(l["path"]), "en": l["en"]} for i, l in enumerate(canon)]
+        out = [{"id": i, "key": ".".join(l["path"]), "en": l["en"],
+                "has_interp": bool(l.get("has_interp"))} for i, l in enumerate(canon)]
         json.dump(out, open(os.path.join(HERE, "leaves.json"), "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
-        print(f"leaves.json: {len(out)} 条(含英文原文,供编辑参考)")
+        print(f"leaves.json: {len(out)} 条(含英文原文,供编辑参考;"
+              f"其中字典 {len(canon_cat)} 条,API注册表 {len(canon_reg)} 条)")
         return
 
     # load language + validate against this exe's English
     lang = json.load(open(args.lang, encoding="utf-8"))
     by_key = {e["key"]: e for e in lang}
-    zh_by_key, bad = {}, 0
-    for i, leaf in enumerate(canon):
+    zh_by_key, bad, interp, drifted, missing = {}, 0, 0, 0, 0
+    for leaf in canon:
         key = ".".join(leaf["path"])
         e = by_key.get(key)
         if not e or not (e.get("zh") or "").strip():
+            if leaf["en"] is not None and not leaf.get("has_interp"):
+                missing += 1
+            continue
+        if leaf.get("has_interp"):
+            interp += 1
             continue
         if ph(leaf["en"]) != ph(e["zh"]):
             bad += 1
             continue
+        # 游戏更新后原文可能已改写:语言包记录的 en 与当前不符则跳过,
+        # 防止把旧译文配到新句子上(应先在 language.json 中重新翻译该条)
+        if e.get("en") and leaf["en"] != e["en"]:
+            drifted += 1
+            continue
         zh_by_key[key] = e["zh"].strip()
     print(f"语言包: {len(lang)} 条,可注入 {len(zh_by_key)} 条"
-          + (f",占位符不合规跳过 {bad} 条" if bad else ""))
+          + (f",原文已变更跳过 {drifted} 条" if drifted else "")
+          + (f",缺失译文 {missing} 条" if missing else "")
+          + (f",占位符不合规跳过 {bad} 条" if bad else "")
+          + (f",含插值跳过 {interp} 条" if interp else ""))
 
-    # solve cache keyed by exe+lang
-    sol_path = os.path.join(HERE, "solutions", f"{os.path.getsize(exe)}.json")
-    lang_sig = hashlib.sha256(json.dumps(zh_by_key, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    # 求解缓存按版本隔离(游戏更新后资产名/尺寸全变,必须另起文件);
+    # lang_sig 只覆盖实际注入的 zh 内容,与 v1.0 已发布的缓存格式保持兼容
+    sol_path = os.path.join(HERE, "solutions", f"{exe_sz}.json")
+    lang_sig = hashlib.sha256(json.dumps(
+        zh_by_key, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     cached = {}
     if os.path.exists(sol_path):
         j = json.load(open(sol_path, encoding="utf-8"))
         if j.get("lang_sig") == lang_sig:
             cached = j.get("solutions", {})
 
-    solutions = {}
+    solutions = dict(cached)   # keep previously solved entries on resume
     for h in hosts:
         name = os.path.basename(h["asset"]["path"])
         T_LEN = h["asset"]["data_len"]
+        new_src, applied = inject(h["src"], h["cat"] + h["reg"], zh_by_key)
+        if applied == 0:
+            print(f"  {name}: 无可注入内容, 保持原样跳过", flush=True)
+            continue
         print(f"  {name}: 注入并求解(目标压缩尺寸 {T_LEN:,}) ...", flush=True)
-        new_src, applied = inject(h["src"], h["leaves"], zh_by_key)
         js = new_src.encode("utf-8")
-        q, R, blob = solve(js, T_LEN, cached.get(name))
+        q, R, off, blob = solve(js, T_LEN, cached.get(name))
         # byte-exact roundtrip check before anything touches disk
         dec = brotli.decompress(blob)
-        if len(blob) != T_LEN or not dec.startswith(js) or dec != js + b"\n/*" + PAD[:R] + b"*/":
+        if len(blob) != T_LEN or not dec.startswith(js) or dec != js + b"\n/*" + PAD[off:off + R] + b"*/":
             raise RuntimeError(f"{name}: 求解结果校验失败")
         h["blob"] = blob
-        solutions[name] = {"q": q, "R": R}
+        solutions[name] = {"q": q, "R": R, "off": off}
         print(f"    注入 {applied} 处, q={q} R={R:,} 校验 OK", flush=True)
-
-    if len(solutions) == len(hosts):
+        # persist each solved asset immediately; a later failure can resume free
         os.makedirs(os.path.join(HERE, "solutions"), exist_ok=True)
         json.dump({"lang_sig": lang_sig, "solutions": solutions},
                   open(sol_path, "w", encoding="utf-8"))
 
     # splice all-or-nothing in memory; only then touch the exe
     for h in hosts:
+        if "blob" not in h:
+            continue
         a = h["asset"]
         data[a["data_file_off"]:a["data_file_off"] + a["data_len"]] = h["blob"]
 
-    bak = exe + ".bak"
-    if not os.path.exists(bak):
-        print(f"备份原版 -> {bak}")
+    # 确保 .bak 始终为当前版本原版:旧版残留会被重建替换
+    if not os.path.exists(bak) or stale:
+        print(f"备份原版 -> {bak}" + ("(替换旧版残留)" if stale else ""))
         open(bak, "wb").write(orig)          # untouched original bytes
     open(exe + ".tmp", "wb").write(bytes(data))
     os.replace(exe + ".tmp", exe)
@@ -605,6 +719,8 @@ def shutil_restore(exe):
     bak = exe + ".bak"
     if not os.path.exists(bak):
         sys.exit("没有 .bak 备份,无需恢复")
+    if os.path.getsize(bak) != os.path.getsize(exe):
+        print("警告: .bak 与当前 exe 尺寸不同(可能属于其他游戏版本),仍按 .bak 恢复")
     import shutil
     shutil.copy2(bak, exe)
     print("已从 .bak 恢复原版")

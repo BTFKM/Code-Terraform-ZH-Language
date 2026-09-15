@@ -2,3 +2,15 @@ leaves.json
 __pycache__/
 *.tmp
 *.bak
+
+# 过程文件(不发布)
+leaves*.json
+run_*.log
+extract_*.log
+mt_incr*
+todo_incr.json
+incr_translate.py
+api_registry_*.json
+translation_api.json
+*.v[0-9]*.bak.json
+solutions_v10.bak.json
