@@ -14,3 +14,7 @@ api_registry_*.json
 translation_api.json
 *.v[0-9]*.bak.json
 solutions_v10.bak.json
+language.new.json
+verify_patch.py
+verify*/
+work/
